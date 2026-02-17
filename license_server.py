@@ -1,7 +1,7 @@
 from fastapi import FastAPI, Request, Header, HTTPException
 from pydantic import BaseModel
 from typing import Optional
-import sqlite3
+import psycopg2
 import time
 import hashlib
 import os
@@ -10,10 +10,12 @@ import os
 # CONFIG
 # ==========================
 
-DB_PATH = "licenses.db"
-
+DATABASE_URL = os.getenv("DATABASE_URL")
 LICENSE_SECRET = os.getenv("LICENSE_SECRET")
 ADMIN_KEY = os.getenv("ADMIN_KEY")
+
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL not set")
 
 if not LICENSE_SECRET or not ADMIN_KEY:
     raise RuntimeError("LICENSE_SECRET or ADMIN_KEY not set")
@@ -29,18 +31,20 @@ app = FastAPI()
 # ==========================
 
 def db():
-    return sqlite3.connect(DB_PATH, check_same_thread=False)
+    return psycopg2.connect(DATABASE_URL)
 
+# Create table on startup
 with db() as conn:
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS licenses (
-            key TEXT PRIMARY KEY,
-            expires INTEGER,
-            hwid TEXT,
-            revoked INTEGER DEFAULT 0
-        )
-    """)
-    conn.commit()
+    with conn.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS licenses (
+                key TEXT PRIMARY KEY,
+                expires BIGINT,
+                hwid TEXT,
+                revoked BOOLEAN DEFAULT FALSE
+            )
+        """)
+        conn.commit()
 
 # ==========================
 # SIGNATURE
@@ -83,11 +87,16 @@ def create_license(
     admin_auth(x_admin_key)
 
     with db() as conn:
-        conn.execute(
-            "INSERT OR REPLACE INTO licenses (key, expires, hwid, revoked) VALUES (?, ?, NULL, 0)",
-            (payload.license, payload.expires)
-        )
-        conn.commit()
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO licenses (key, expires, hwid, revoked)
+                VALUES (%s, %s, NULL, FALSE)
+                ON CONFLICT (key)
+                DO UPDATE SET
+                    expires = EXCLUDED.expires,
+                    revoked = FALSE
+            """, (payload.license, payload.expires))
+            conn.commit()
 
     return {"status": "created", "license": payload.license}
 
@@ -100,11 +109,12 @@ def revoke_license(
     admin_auth(x_admin_key)
 
     with db() as conn:
-        conn.execute(
-            "UPDATE licenses SET revoked = 1 WHERE key = ?",
-            (license,)
-        )
-        conn.commit()
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE licenses SET revoked = TRUE WHERE key = %s",
+                (license,)
+            )
+            conn.commit()
 
     return {"status": "revoked", "license": license}
 
@@ -116,16 +126,18 @@ def list_licenses(
     admin_auth(x_admin_key)
 
     with db() as conn:
-        rows = conn.execute(
-            "SELECT key, expires, hwid, revoked FROM licenses"
-        ).fetchall()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT key, expires, hwid, revoked FROM licenses"
+            )
+            rows = cur.fetchall()
 
     return [
         {
             "license": r[0],
             "expires": r[1],
             "hwid": r[2],
-            "revoked": bool(r[3])
+            "revoked": r[3]
         }
         for r in rows
     ]
@@ -139,10 +151,12 @@ def verify_license(payload: VerifyPayload):
     now = int(time.time())
 
     with db() as conn:
-        row = conn.execute(
-            "SELECT expires, hwid, revoked FROM licenses WHERE key = ?",
-            (payload.license,)
-        ).fetchone()
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT expires, hwid, revoked FROM licenses WHERE key = %s",
+                (payload.license,)
+            )
+            row = cur.fetchone()
 
     # License not found
     if not row:
@@ -173,11 +187,12 @@ def verify_license(payload: VerifyPayload):
     # First HWID bind
     if hwid is None:
         with db() as conn:
-            conn.execute(
-                "UPDATE licenses SET hwid = ? WHERE key = ?",
-                (payload.hwid, payload.license)
-            )
-            conn.commit()
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE licenses SET hwid = %s WHERE key = %s",
+                    (payload.hwid, payload.license)
+                )
+                conn.commit()
 
     # HWID mismatch
     elif hwid != payload.hwid:
@@ -187,7 +202,7 @@ def verify_license(payload: VerifyPayload):
             "signature": sign(False, expires)
         }
 
-    # ✅ VALID
+    # VALID
     return {
         "valid": True,
         "expires": expires,
