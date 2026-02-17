@@ -1,155 +1,195 @@
 from fastapi import FastAPI, Request, Header, HTTPException
 from pydantic import BaseModel
-import hashlib
-import time
-import os
-import sqlite3
 from typing import Optional
+import sqlite3
+import time
+import hashlib
+import os
 
-# ================== CONFIG ==================
+# ==========================
+# CONFIG
+# ==========================
+
 DB_PATH = "licenses.db"
-SECRET = os.getenv("LICENSE_SECRET")
+
+LICENSE_SECRET = os.getenv("LICENSE_SECRET")
 ADMIN_KEY = os.getenv("ADMIN_KEY")
 
-if not SECRET:
-    raise RuntimeError("LICENSE_SECRET not set")
-if not ADMIN_KEY:
-    raise RuntimeError("ADMIN_KEY not set")
+if not LICENSE_SECRET or not ADMIN_KEY:
+    raise RuntimeError("LICENSE_SECRET or ADMIN_KEY not set")
+
+# ==========================
+# APP
+# ==========================
 
 app = FastAPI()
 
-# ================== DATABASE ==================
+# ==========================
+# DATABASE
+# ==========================
+
 def db():
     return sqlite3.connect(DB_PATH, check_same_thread=False)
 
-def init_db():
-    with db() as conn:
-        conn.execute("""
+with db() as conn:
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS licenses (
-            license TEXT PRIMARY KEY,
-            hwid TEXT,
+            key TEXT PRIMARY KEY,
             expires INTEGER,
+            hwid TEXT,
             revoked INTEGER DEFAULT 0
         )
-        """)
-init_db()
+    """)
+    conn.commit()
 
-# ================== MODELS ==================
-class LicenseRequest(BaseModel):
+# ==========================
+# SIGNATURE
+# ==========================
+
+def sign(valid: bool, expires: int) -> str:
+    msg = f"{valid}|{expires}"
+    return hashlib.sha256((msg + LICENSE_SECRET).encode()).hexdigest()
+
+# ==========================
+# MODELS
+# ==========================
+
+class VerifyPayload(BaseModel):
     license: str
     hwid: str
     ts: int
 
-class AdminCreate(BaseModel):
+class CreatePayload(BaseModel):
     license: str
     expires: int
 
-# ================== RATE LIMIT ==================
-RATE_LIMIT = {}  # ip -> [count, reset_time]
+# ==========================
+# ADMIN AUTH
+# ==========================
 
-def check_rate_limit(ip: str):
-    now = time.time()
-    entry = RATE_LIMIT.get(ip)
+def admin_auth(key: Optional[str]):
+    if key != ADMIN_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
 
-    if not entry or now > entry[1]:
-        RATE_LIMIT[ip] = [1, now + 60]
-        return
+# ==========================
+# ADMIN ENDPOINTS
+# ==========================
 
-    if entry[0] >= 30:
-        raise HTTPException(429, "Too many requests")
-
-    entry[0] += 1
-
-# ================== VERIFY ENDPOINT ==================
-@app.post("/api/license/verify")
-def verify_license(
-    payload: LicenseRequest,
-    request: Request
+@app.post("/admin/create")
+def create_license(
+    payload: CreatePayload,
+    x_admin_key: Optional[str] = Header(None)
 ):
-    ip = request.client.host
-    check_rate_limit(ip)
+    admin_auth(x_admin_key)
 
     with db() as conn:
-        cur = conn.execute(
-            "SELECT hwid, expires, revoked FROM licenses WHERE license=?",
-            (payload.license,)
+        conn.execute(
+            "INSERT OR REPLACE INTO licenses (key, expires, hwid, revoked) VALUES (?, ?, NULL, 0)",
+            (payload.license, payload.expires)
         )
-        row = cur.fetchone()
+        conn.commit()
 
+    return {"status": "created", "license": payload.license}
+
+
+@app.post("/admin/revoke")
+def revoke_license(
+    license: str,
+    x_admin_key: Optional[str] = Header(None)
+):
+    admin_auth(x_admin_key)
+
+    with db() as conn:
+        conn.execute(
+            "UPDATE licenses SET revoked = 1 WHERE key = ?",
+            (license,)
+        )
+        conn.commit()
+
+    return {"status": "revoked", "license": license}
+
+
+@app.get("/admin/licenses")
+def list_licenses(
+    x_admin_key: Optional[str] = Header(None)
+):
+    admin_auth(x_admin_key)
+
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT key, expires, hwid, revoked FROM licenses"
+        ).fetchall()
+
+    return [
+        {
+            "license": r[0],
+            "expires": r[1],
+            "hwid": r[2],
+            "revoked": bool(r[3])
+        }
+        for r in rows
+    ]
+
+# ==========================
+# VERIFY ENDPOINT
+# ==========================
+
+@app.post("/api/license/verify")
+def verify_license(payload: VerifyPayload):
+    now = int(time.time())
+
+    with db() as conn:
+        row = conn.execute(
+            "SELECT expires, hwid, revoked FROM licenses WHERE key = ?",
+            (payload.license,)
+        ).fetchone()
+
+    # License not found
     if not row:
-        return {"valid": False}
+        return {
+            "valid": False,
+            "expires": 0,
+            "signature": sign(False, 0)
+        }
 
-    hwid, expires, revoked = row
+    expires, hwid, revoked = row
 
-    if revoked or expires < time.time():
-        return {"valid": False}
+    # Revoked
+    if revoked:
+        return {
+            "valid": False,
+            "expires": expires,
+            "signature": sign(False, expires)
+        }
 
-    # Bind HWID
+    # Expired
+    if expires < now:
+        return {
+            "valid": False,
+            "expires": expires,
+            "signature": sign(False, expires)
+        }
+
+    # First HWID bind
     if hwid is None:
         with db() as conn:
             conn.execute(
-                "UPDATE licenses SET hwid=? WHERE license=?",
+                "UPDATE licenses SET hwid = ? WHERE key = ?",
                 (payload.hwid, payload.license)
             )
+            conn.commit()
+
+    # HWID mismatch
     elif hwid != payload.hwid:
-        return {"valid": False}
+        return {
+            "valid": False,
+            "expires": expires,
+            "signature": sign(False, expires)
+        }
 
-    msg = f"True|{expires}"
-    signature = hashlib.sha256((msg + SECRET).encode()).hexdigest()
-
+    # ✅ VALID
     return {
         "valid": True,
         "expires": expires,
-        "signature": signature
+        "signature": sign(True, expires)
     }
-
-# ================== ADMIN AUTH ==================
-def admin_auth(key: Optional[str]):
-    if key != ADMIN_KEY:
-        raise HTTPException(401, "Unauthorized")
-
-# ================== ADMIN ENDPOINTS ==================
-@app.post("/admin/create")
-def admin_create(
-    payload: AdminCreate,
-    x_admin_key: Optional[str] = Header(None)
-):
-    admin_auth(x_admin_key)
-
-    with db() as conn:
-        conn.execute(
-            "INSERT OR REPLACE INTO licenses (license, hwid, expires, revoked) VALUES (?, NULL, ?, 0)",
-            (payload.license, payload.expires)
-        )
-
-    return {"status": "created"}
-
-@app.post("/admin/revoke/{license_key}")
-def admin_revoke(
-    license_key: str,
-    x_admin_key: Optional[str] = Header(None)
-):
-    admin_auth(x_admin_key)
-
-    with db() as conn:
-        conn.execute(
-            "UPDATE licenses SET revoked=1 WHERE license=?",
-            (license_key,)
-        )
-
-    return {"status": "revoked"}
-
-@app.post("/admin/reset/{license_key}")
-def admin_reset_hwid(
-    license_key: str,
-    x_admin_key: Optional[str] = Header(None)
-):
-    admin_auth(x_admin_key)
-
-    with db() as conn:
-        conn.execute(
-            "UPDATE licenses SET hwid=NULL WHERE license=?",
-            (license_key,)
-        )
-
-    return {"status": "hwid reset"}
